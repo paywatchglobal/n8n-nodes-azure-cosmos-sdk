@@ -454,7 +454,7 @@ export class AzureCosmosSdk implements INodeType {
 				default: '/partitionKey',
 				required: true,
 				placeholder: '/partitionKey',
-				description: 'The partition key path (e.g., /partitionKey, /category, /userId). Must start with /',
+				description: 'The partition key path (e.g., /partitionKey, /category, /userId). Must start with /.',
 				displayOptions: {
 					show: {
 						operation: ['createContainer'],
@@ -585,7 +585,6 @@ export class AzureCosmosSdk implements INodeType {
 				type: 'resourceLocator',
 				default: { mode: 'list', value: '' },
 				required: true,
-				description: 'The database to delete',
 				displayOptions: {
 					show: {
 						operation: ['deleteDatabase'],
