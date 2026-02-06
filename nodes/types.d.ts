@@ -22,21 +22,3 @@ declare function fetch(
 }>;
 
 declare function encodeURIComponent(str: string): string;
-
-declare module '@azure/cosmos' {
-	export interface TokenCredential {
-		getToken(): Promise<{
-			token: string;
-			expiresOnTimestamp: number;
-		}>;
-	}
-
-	export class CosmosClient {
-		constructor(options: {
-			endpoint: string;
-			key?: string;
-			aadCredentials?: TokenCredential;
-		});
-		database(id: string): any;
-	}
-}
