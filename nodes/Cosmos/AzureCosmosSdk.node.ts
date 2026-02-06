@@ -1,4 +1,5 @@
 import type {
+	IDataObject,
 	IExecuteFunctions,
 	ILoadOptionsFunctions,
 	INodeExecutionData,
@@ -7,9 +8,54 @@ import type {
 	INodeType,
 	INodeTypeDescription,
 } from 'n8n-workflow';
-import { NodeOperationError } from 'n8n-workflow';
-import { CosmosClient } from '@azure/cosmos';
-import type { TokenCredential } from '@azure/cosmos';
+import { ApplicationError, NodeOperationError } from 'n8n-workflow';
+import {
+	CosmosClient,
+	PartitionKeyKind,
+	VectorEmbeddingDataType,
+	VectorEmbeddingDistanceFunction,
+	VectorIndexType,
+} from '@azure/cosmos';
+import type { ContainerRequest, IndexingPolicy, RequestOptions } from '@azure/cosmos';
+import type { TokenCredential } from '@azure/core-auth';
+
+async function fetchClientCredentialsToken(
+	tenantId: string,
+	clientId: string,
+	clientSecret: string,
+): Promise<{ access_token: string; expires_on: number }> {
+	const tokenUrl = `https://login.microsoftonline.com/${encodeURIComponent(tenantId)}/oauth2/v2.0/token`;
+	const body = new URLSearchParams({
+		grant_type: 'client_credentials',
+		client_id: clientId,
+		client_secret: clientSecret,
+		scope: 'https://cosmos.azure.com/.default',
+	});
+
+	const response = await fetch(tokenUrl, {
+		method: 'POST',
+		headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+		body: body.toString(),
+	});
+
+	const tokenData = (await response.json()) as {
+		access_token?: string;
+		expires_on?: string;
+		error?: string;
+		error_description?: string;
+	};
+
+	if (!response.ok || !tokenData.access_token) {
+		throw new ApplicationError(
+			`Failed to obtain access token: ${tokenData.error_description || tokenData.error || 'Unknown error'}`,
+		);
+	}
+
+	return {
+		access_token: tokenData.access_token,
+		expires_on: tokenData.expires_on ? Number(tokenData.expires_on) * 1000 : Date.now() + 3600000,
+	};
+}
 
 export class AzureCosmosSdk implements INodeType {
 	description: INodeTypeDescription = {
@@ -45,6 +91,15 @@ export class AzureCosmosSdk implements INodeType {
 					},
 				},
 			},
+			{
+				name: 'azureCosmosSdkEntraIdAppApi',
+				required: true,
+				displayOptions: {
+					show: {
+						authenticationType: ['entraIdApp'],
+					},
+				},
+			},
 		],
 		properties: [
 			{
@@ -58,9 +113,14 @@ export class AzureCosmosSdk implements INodeType {
 						description: 'Authenticate using Cosmos DB master key',
 					},
 					{
-						name: 'Microsoft Entra ID',
+						name: 'Microsoft Entra ID (Delegated)',
 						value: 'entraId',
-						description: 'Authenticate using Microsoft Entra ID (Azure AD) OAuth2',
+						description: 'Authenticate using delegated permissions with user login (user_impersonation scope)',
+					},
+					{
+						name: 'Microsoft Entra ID (Application)',
+						value: 'entraIdApp',
+						description: 'Authenticate using application permissions with client credentials (.default scope)',
 					},
 				],
 				default: 'masterKey',
@@ -73,16 +133,16 @@ export class AzureCosmosSdk implements INodeType {
 				noDataExpression: true,
 				options: [
 					{
-						name: 'Select',
-						value: 'select',
-						description: 'Query documents using SQL',
-						action: 'Query documents',
+						name: 'Create Container',
+						value: 'createContainer',
+						description: 'Create a new container with partition key, vector index, and full-text index support',
+						action: 'Create a container',
 					},
 					{
-						name: 'Insert',
-						value: 'insert',
-						description: 'Insert a new document (fails if ID exists)',
-						action: 'Insert a document',
+						name: 'Create Database',
+						value: 'createDatabase',
+						description: 'Create a new Cosmos DB database',
+						action: 'Create a database',
 					},
 					{
 						name: 'Create or Update',
@@ -97,16 +157,10 @@ export class AzureCosmosSdk implements INodeType {
 						action: 'Delete documents',
 					},
 					{
-						name: 'Create Database',
-						value: 'createDatabase',
-						description: 'Create a new Cosmos DB database',
-						action: 'Create a database',
-					},
-					{
-						name: 'Create Container',
-						value: 'createContainer',
-						description: 'Create a new container with partition key, vector index, and full-text index support',
-						action: 'Create a container',
+						name: 'Delete Container',
+						value: 'deleteContainer',
+						description: 'Delete a container from a database',
+						action: 'Delete a container',
 					},
 					{
 						name: 'Delete Database',
@@ -115,10 +169,16 @@ export class AzureCosmosSdk implements INodeType {
 						action: 'Delete a database',
 					},
 					{
-						name: 'Delete Container',
-						value: 'deleteContainer',
-						description: 'Delete a container from a database',
-						action: 'Delete a container',
+						name: 'Insert',
+						value: 'insert',
+						description: 'Insert a new document (fails if ID exists)',
+						action: 'Insert a document',
+					},
+					{
+						name: 'Select',
+						value: 'select',
+						description: 'Query documents using SQL',
+						action: 'Query documents',
 					},
 				],
 				default: 'select',
@@ -402,7 +462,7 @@ export class AzureCosmosSdk implements INodeType {
 				default: '/partitionKey',
 				required: true,
 				placeholder: '/partitionKey',
-				description: 'The partition key path (e.g., /partitionKey, /category, /userId). Must start with /',
+				description: 'The partition key path (e.g., /partitionKey, /category, /userId). Must start with /.',
 				displayOptions: {
 					show: {
 						operation: ['createContainer'],
@@ -448,26 +508,6 @@ export class AzureCosmosSdk implements INodeType {
 				},
 				options: [
 					{
-						displayName: 'Vector Path',
-						name: 'vectorPath',
-						type: 'string',
-						default: '/vector',
-						placeholder: '/embedding',
-						description: 'The path to the vector field (e.g., /vector, /embedding)',
-					},
-					{
-						displayName: 'Vector Type',
-						name: 'vectorType',
-						type: 'options',
-						options: [
-							{ name: 'Float32', value: 'float32' },
-							{ name: 'Int8', value: 'int8' },
-							{ name: 'UInt8', value: 'uint8' },
-						],
-						default: 'float32',
-						description: 'The data type of the vector elements',
-					},
-					{
 						displayName: 'Dimensions',
 						name: 'dimensions',
 						type: 'number',
@@ -498,6 +538,26 @@ export class AzureCosmosSdk implements INodeType {
 						],
 						default: 'quantizedFlat',
 						description: 'The type of vector index to use',
+					},
+					{
+						displayName: 'Vector Path',
+						name: 'vectorPath',
+						type: 'string',
+						default: '/vector',
+						placeholder: '/embedding',
+						description: 'The path to the vector field (e.g., /vector, /embedding)',
+					},
+					{
+						displayName: 'Vector Type',
+						name: 'vectorType',
+						type: 'options',
+						options: [
+							{ name: 'Float32', value: 'float32' },
+							{ name: 'Int8', value: 'int8' },
+							{ name: 'UInt8', value: 'uint8' },
+						],
+						default: 'float32',
+						description: 'The data type of the vector elements',
 					},
 				],
 			},
@@ -533,7 +593,6 @@ export class AzureCosmosSdk implements INodeType {
 				type: 'resourceLocator',
 				default: { mode: 'list', value: '' },
 				required: true,
-				description: 'The database to delete',
 				displayOptions: {
 					show: {
 						operation: ['deleteDatabase'],
@@ -702,10 +761,10 @@ export class AzureCosmosSdk implements INodeType {
 		let client: CosmosClient;
 		
 		if (authenticationType === 'entraId') {
-			// Use Entra ID authentication with Microsoft OAuth2
+			// Use Entra ID authentication with Microsoft OAuth2 (delegated permissions)
 			const entraIdCredentials = await this.getCredentials('azureCosmosSdkEntraIdApi');
 			const endpoint = entraIdCredentials.endpoint as string;
-			const oauthTokenData = entraIdCredentials.oauthTokenData as any;
+			const oauthTokenData = entraIdCredentials.oauthTokenData as { access_token: string; expires_at?: string | number };
 			const refreshBeforeExpirySeconds = (entraIdCredentials.refreshBeforeExpirySeconds as number) || 900;
 
 			// Check if token needs refresh based on buffer
@@ -732,7 +791,7 @@ export class AzureCosmosSdk implements INodeType {
 						},
 					);
 					this.logger.info('✅ Token refreshed successfully via Cosmos DB API call');
-				} catch (error) {
+				} catch {
 					this.logger.warn('Token refresh attempt failed, continuing with existing token');
 				}
 			} else {
@@ -747,6 +806,26 @@ export class AzureCosmosSdk implements INodeType {
 					return {
 						token: oauthTokenData.access_token,
 						expiresOnTimestamp: expiresAt || Date.now() + (3600 * 1000),
+					};
+				},
+			};
+
+			client = new CosmosClient({ endpoint, aadCredentials: tokenCredential });
+		} else if (authenticationType === 'entraIdApp') {
+			// Use Entra ID authentication with client credentials (application permissions)
+			const appCredentials = await this.getCredentials('azureCosmosSdkEntraIdAppApi');
+			const endpoint = appCredentials.endpoint as string;
+			const tenantId = appCredentials.tenantId as string;
+			const clientId = appCredentials.clientId as string;
+			const clientSecret = appCredentials.clientSecret as string;
+
+			const tokenResult = await fetchClientCredentialsToken(tenantId, clientId, clientSecret);
+
+			const tokenCredential: TokenCredential = {
+				async getToken() {
+					return {
+						token: tokenResult.access_token,
+						expiresOnTimestamp: tokenResult.expires_on,
 					};
 				},
 			};
@@ -1010,14 +1089,14 @@ export class AzureCosmosSdk implements INodeType {
 					const databaseThroughput = this.getNodeParameter('databaseThroughput', itemIndex) as number;
 
 					try {
-						const dbOptions: any = { id: newDatabaseName };
+						const dbOptions: { id: string; throughput?: number } = { id: newDatabaseName };
 						
 						// Add throughput if specified (minimum 400 RU/s)
 						if (databaseThroughput && databaseThroughput >= 400) {
 							dbOptions.throughput = databaseThroughput;
 						}
 
-						const { statusCode, database } = await (client as any).databases.createIfNotExists(dbOptions);
+						const { statusCode, database } = await client.databases.createIfNotExists(dbOptions);
 
 						returnData.push({
 							json: {
@@ -1050,16 +1129,16 @@ export class AzureCosmosSdk implements INodeType {
 						const database = client.database(dbName);
 						
 						// Build container definition
-						const containerDef: any = {
+						const containerDef: ContainerRequest = {
 							id: newContainerName,
 							partitionKey: {
 								paths: [partitionKeyPath],
-								kind: 'Hash',
+								kind: PartitionKeyKind.Hash,
 							},
 						};
 
 						// Build indexing policy
-						const indexingPolicy: any = {
+						const indexingPolicy: IndexingPolicy = {
 							automatic: true,
 							indexingMode: 'consistent',
 							includedPaths: [{ path: '/*' }],
@@ -1087,9 +1166,9 @@ export class AzureCosmosSdk implements INodeType {
 								vectorEmbeddings: [
 									{
 										path: vectorPath,
-										dataType: vectorType,
+										dataType: vectorType as VectorEmbeddingDataType,
 										dimensions: dimensions,
-										distanceFunction: distanceFunction,
+										distanceFunction: distanceFunction as VectorEmbeddingDistanceFunction,
 									},
 								],
 							};
@@ -1100,11 +1179,13 @@ export class AzureCosmosSdk implements INodeType {
 							}
 							indexingPolicy.vectorIndexes.push({
 								path: vectorPath,
-								type: indexType,
+								type: indexType as VectorIndexType,
 							});
 
 							// Exclude vector path from regular indexing to save RU/s
-							indexingPolicy.excludedPaths.push({ path: `${vectorPath}/*` });
+							if (indexingPolicy.excludedPaths) {
+								indexingPolicy.excludedPaths.push({ path: `${vectorPath}/*` });
+							}
 						}
 
 						// Add full-text index configuration
@@ -1139,9 +1220,9 @@ export class AzureCosmosSdk implements INodeType {
 						containerDef.indexingPolicy = indexingPolicy;
 
 						// Add throughput if specified
-						const createOptions: any = {};
+						const createOptions: RequestOptions = {};
 						if (containerThroughput && containerThroughput >= 400) {
-							createOptions.throughput = containerThroughput;
+							createOptions.offerThroughput = containerThroughput;
 						}
 
 						const { statusCode, container: newContainer } = await database.containers.createIfNotExists(
@@ -1149,7 +1230,7 @@ export class AzureCosmosSdk implements INodeType {
 							createOptions,
 						);
 
-						const responseData: any = {
+						const responseData: IDataObject = {
 							success: true,
 							statusCode,
 							containerId: newContainer.id,
@@ -1159,7 +1240,12 @@ export class AzureCosmosSdk implements INodeType {
 						};
 
 						if (enableVectorIndex) {
-							const vectorConfig = this.getNodeParameter('vectorIndexConfig', itemIndex, {}) as any;
+							const vectorConfig = this.getNodeParameter('vectorIndexConfig', itemIndex, {}) as {
+								vectorPath?: string;
+								indexType?: string;
+								dimensions?: number;
+								distanceFunction?: string;
+							};
 							responseData.vectorIndex = {
 								enabled: true,
 								path: vectorConfig.vectorPath || '/vector',
@@ -1286,21 +1372,42 @@ export class AzureCosmosSdk implements INodeType {
 
 				try {
 					if (authenticationType === 'entraId') {
-						// Use Entra ID authentication
+						// Use Entra ID authentication (delegated)
 						const credentials = await this.getCredentials('azureCosmosSdkEntraIdApi');
 						const endpoint = credentials.endpoint as string;
-						const oauthTokenData = credentials.oauthTokenData as any;
+						const oauthTokenData = credentials.oauthTokenData as { access_token: string; expires_at?: string | number };
 
 						if (!oauthTokenData?.access_token) {
-							throw new Error('No valid access token available. Please re-authenticate.');
+							throw new ApplicationError('No valid access token available. Please re-authenticate.');
 						}
 
 						const tokenCredential: TokenCredential = {
 							getToken: async () => ({
 								token: oauthTokenData.access_token,
-								expiresOnTimestamp: oauthTokenData.expires_at 
-									? new Date(oauthTokenData.expires_at).getTime() 
+								expiresOnTimestamp: oauthTokenData.expires_at
+									? new Date(oauthTokenData.expires_at).getTime()
 									: Date.now() + 3600000,
+							}),
+						};
+
+						client = new CosmosClient({
+							endpoint,
+							aadCredentials: tokenCredential,
+						});
+					} else if (authenticationType === 'entraIdApp') {
+						// Use Entra ID authentication (application / client credentials)
+						const appCredentials = await this.getCredentials('azureCosmosSdkEntraIdAppApi');
+						const endpoint = appCredentials.endpoint as string;
+						const tenantId = appCredentials.tenantId as string;
+						const clientId = appCredentials.clientId as string;
+						const clientSecret = appCredentials.clientSecret as string;
+
+						const tokenResult = await fetchClientCredentialsToken(tenantId, clientId, clientSecret);
+
+						const tokenCredential: TokenCredential = {
+							getToken: async () => ({
+								token: tokenResult.access_token,
+								expiresOnTimestamp: tokenResult.expires_on,
 							}),
 						};
 
@@ -1317,10 +1424,10 @@ export class AzureCosmosSdk implements INodeType {
 					}
 
 					// Fetch databases using the SDK
-					const { resources: databases } = await (client as any).databases.readAll().fetchAll();
+					const { resources: databases } = await client.databases.readAll().fetchAll();
 
 					// Map databases to options format
-					let results: INodePropertyOptions[] = databases.map((db: any) => ({
+					let results: INodePropertyOptions[] = databases.map((db: { id: string }) => ({
 						name: db.id,
 						value: db.id,
 					}));
@@ -1335,7 +1442,7 @@ export class AzureCosmosSdk implements INodeType {
 						results: results.sort((a, b) => a.name.localeCompare(b.name)),
 					};
 				} catch (error) {
-					throw new Error(`Failed to load databases: ${error.message}`);
+					throw new ApplicationError(`Failed to load databases: ${(error as Error).message}`);
 				}
 			},
 			async getContainers(
@@ -1347,21 +1454,42 @@ export class AzureCosmosSdk implements INodeType {
 
 				try {
 					if (authenticationType === 'entraId') {
-						// Use Entra ID authentication
+						// Use Entra ID authentication (delegated)
 						const credentials = await this.getCredentials('azureCosmosSdkEntraIdApi');
 						const endpoint = credentials.endpoint as string;
-						const oauthTokenData = credentials.oauthTokenData as any;
+						const oauthTokenData = credentials.oauthTokenData as { access_token: string; expires_at?: string | number };
 
 						if (!oauthTokenData?.access_token) {
-							throw new Error('No valid access token available. Please re-authenticate.');
+							throw new ApplicationError('No valid access token available. Please re-authenticate.');
 						}
 
 						const tokenCredential: TokenCredential = {
 							getToken: async () => ({
 								token: oauthTokenData.access_token,
-								expiresOnTimestamp: oauthTokenData.expires_at 
-									? new Date(oauthTokenData.expires_at).getTime() 
+								expiresOnTimestamp: oauthTokenData.expires_at
+									? new Date(oauthTokenData.expires_at).getTime()
 									: Date.now() + 3600000,
+							}),
+						};
+
+						client = new CosmosClient({
+							endpoint,
+							aadCredentials: tokenCredential,
+						});
+					} else if (authenticationType === 'entraIdApp') {
+						// Use Entra ID authentication (application / client credentials)
+						const appCredentials = await this.getCredentials('azureCosmosSdkEntraIdAppApi');
+						const endpoint = appCredentials.endpoint as string;
+						const tenantId = appCredentials.tenantId as string;
+						const clientId = appCredentials.clientId as string;
+						const clientSecret = appCredentials.clientSecret as string;
+
+						const tokenResult = await fetchClientCredentialsToken(tenantId, clientId, clientSecret);
+
+						const tokenCredential: TokenCredential = {
+							getToken: async () => ({
+								token: tokenResult.access_token,
+								expiresOnTimestamp: tokenResult.expires_on,
 							}),
 						};
 
@@ -1378,9 +1506,9 @@ export class AzureCosmosSdk implements INodeType {
 					}
 
 					// Get the selected database name
-					const databaseParam = this.getNodeParameter('databaseForContainerDelete', 0) as any;
+					const databaseParam = this.getNodeParameter('databaseForContainerDelete', 0) as string | { value: string };
 					const databaseName = typeof databaseParam === 'string' ? databaseParam : (databaseParam?.value || '');
-					
+
 					if (!databaseName) {
 						return { results: [] };
 					}
@@ -1391,7 +1519,7 @@ export class AzureCosmosSdk implements INodeType {
 					const { resources: containers } = await database.containers.readAll().fetchAll();
 
 					// Map containers to options format
-					let results: INodePropertyOptions[] = containers.map((container: any) => ({
+					let results: INodePropertyOptions[] = containers.map((container: { id: string }) => ({
 						name: container.id,
 						value: container.id,
 					}));
@@ -1406,7 +1534,7 @@ export class AzureCosmosSdk implements INodeType {
 						results: results.sort((a, b) => a.name.localeCompare(b.name)),
 					};
 				} catch (error) {
-					throw new Error(`Failed to load containers: ${error.message}`);
+					throw new ApplicationError(`Failed to load containers: ${(error as Error).message}`);
 				}
 			},
 			async getContainersForDocOps(
@@ -1418,21 +1546,42 @@ export class AzureCosmosSdk implements INodeType {
 
 				try {
 					if (authenticationType === 'entraId') {
-						// Use Entra ID authentication
+						// Use Entra ID authentication (delegated)
 						const credentials = await this.getCredentials('azureCosmosSdkEntraIdApi');
 						const endpoint = credentials.endpoint as string;
-						const oauthTokenData = credentials.oauthTokenData as any;
+						const oauthTokenData = credentials.oauthTokenData as { access_token: string; expires_at?: string | number };
 
 						if (!oauthTokenData?.access_token) {
-							throw new Error('No valid access token available. Please re-authenticate.');
+							throw new ApplicationError('No valid access token available. Please re-authenticate.');
 						}
 
 						const tokenCredential: TokenCredential = {
 							getToken: async () => ({
 								token: oauthTokenData.access_token,
-								expiresOnTimestamp: oauthTokenData.expires_at 
-									? new Date(oauthTokenData.expires_at).getTime() 
+								expiresOnTimestamp: oauthTokenData.expires_at
+									? new Date(oauthTokenData.expires_at).getTime()
 									: Date.now() + 3600000,
+							}),
+						};
+
+						client = new CosmosClient({
+							endpoint,
+							aadCredentials: tokenCredential,
+						});
+					} else if (authenticationType === 'entraIdApp') {
+						// Use Entra ID authentication (application / client credentials)
+						const appCredentials = await this.getCredentials('azureCosmosSdkEntraIdAppApi');
+						const endpoint = appCredentials.endpoint as string;
+						const tenantId = appCredentials.tenantId as string;
+						const clientId = appCredentials.clientId as string;
+						const clientSecret = appCredentials.clientSecret as string;
+
+						const tokenResult = await fetchClientCredentialsToken(tenantId, clientId, clientSecret);
+
+						const tokenCredential: TokenCredential = {
+							getToken: async () => ({
+								token: tokenResult.access_token,
+								expiresOnTimestamp: tokenResult.expires_on,
 							}),
 						};
 
@@ -1449,9 +1598,9 @@ export class AzureCosmosSdk implements INodeType {
 					}
 
 					// Get the selected database name for document operations
-					const databaseParam = this.getNodeParameter('databaseName', 0) as any;
+					const databaseParam = this.getNodeParameter('databaseName', 0) as string | { value: string };
 					const databaseName = typeof databaseParam === 'string' ? databaseParam : (databaseParam?.value || '');
-					
+
 					if (!databaseName) {
 						return { results: [] };
 					}
@@ -1462,7 +1611,7 @@ export class AzureCosmosSdk implements INodeType {
 					const { resources: containers } = await database.containers.readAll().fetchAll();
 
 					// Map containers to options format
-					let results: INodePropertyOptions[] = containers.map((container: any) => ({
+					let results: INodePropertyOptions[] = containers.map((container: { id: string }) => ({
 						name: container.id,
 						value: container.id,
 					}));
@@ -1477,7 +1626,7 @@ export class AzureCosmosSdk implements INodeType {
 						results: results.sort((a, b) => a.name.localeCompare(b.name)),
 					};
 				} catch (error) {
-					throw new Error(`Failed to load containers: ${error.message}`);
+					throw new ApplicationError(`Failed to load containers: ${(error as Error).message}`);
 				}
 			},
 		},

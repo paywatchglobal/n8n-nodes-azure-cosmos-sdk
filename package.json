@@ -1,19 +1,19 @@
 {
-    "name": "n8n-nodes-azure-cosmos-sdk",
+    "name": "@paywatchglobal/n8n-nodes-azure-cosmos-sdk",
     "version": "0.2.1",
     "description": "n8n node for Azure Cosmos DB using official SDK with hybrid search, vector similarity, and Entra ID support",
     "license": "MIT",
-    "homepage": "https://github.com/wtyeung/n8n-nodes-azure-cosmos-sdk",
+    "homepage": "https://github.com/paywatchglobal/n8n-nodes-azure-cosmos-sdk",
     "keywords": [
         "n8n-community-node-package"
     ],
     "author": {
-        "name": "Tim Yeung",
-        "email": "tim.yeung@hku.hk"
+        "name": "Paywatch",
+        "email": "appdev@paywatchglobal.com"
     },
     "repository": {
         "type": "git",
-        "url": "https://github.com/wtyeung/n8n-nodes-azure-cosmos-sdk.git"
+        "url": "https://github.com/paywatchglobal/n8n-nodes-azure-cosmos-sdk.git"
     },
     "scripts": {
         "build": "n8n-node build",
@@ -34,7 +34,8 @@
         "n8nNodesApiVersion": 1,
         "credentials": [
             "dist/credentials/AzureCosmosSdkApi.credentials.js",
-            "dist/credentials/AzureCosmosSdkEntraIdApi.credentials.js"
+            "dist/credentials/AzureCosmosSdkEntraIdApi.credentials.js",
+            "dist/credentials/AzureCosmosSdkEntraIdAppApi.credentials.js"
         ],
         "nodes": [
             "dist/nodes/Cosmos/AzureCosmosSdk.node.js"
