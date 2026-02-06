@@ -34,7 +34,8 @@
         "n8nNodesApiVersion": 1,
         "credentials": [
             "dist/credentials/AzureCosmosSdkApi.credentials.js",
-            "dist/credentials/AzureCosmosSdkEntraIdApi.credentials.js"
+            "dist/credentials/AzureCosmosSdkEntraIdApi.credentials.js",
+            "dist/credentials/AzureCosmosSdkEntraIdAppApi.credentials.js"
         ],
         "nodes": [
             "dist/nodes/Cosmos/AzureCosmosSdk.node.js"

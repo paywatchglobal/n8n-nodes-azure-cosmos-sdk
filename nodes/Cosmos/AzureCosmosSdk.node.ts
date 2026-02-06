@@ -11,6 +11,44 @@ import { NodeOperationError } from 'n8n-workflow';
 import { CosmosClient } from '@azure/cosmos';
 import type { TokenCredential } from '@azure/cosmos';
 
+async function fetchClientCredentialsToken(
+	tenantId: string,
+	clientId: string,
+	clientSecret: string,
+): Promise<{ access_token: string; expires_on: number }> {
+	const tokenUrl = `https://login.microsoftonline.com/${encodeURIComponent(tenantId)}/oauth2/v2.0/token`;
+	const body = new URLSearchParams({
+		grant_type: 'client_credentials',
+		client_id: clientId,
+		client_secret: clientSecret,
+		scope: 'https://cosmos.azure.com/.default',
+	});
+
+	const response = await fetch(tokenUrl, {
+		method: 'POST',
+		headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+		body: body.toString(),
+	});
+
+	const tokenData = (await response.json()) as {
+		access_token?: string;
+		expires_on?: string;
+		error?: string;
+		error_description?: string;
+	};
+
+	if (!response.ok || !tokenData.access_token) {
+		throw new Error(
+			`Failed to obtain access token: ${tokenData.error_description || tokenData.error || 'Unknown error'}`,
+		);
+	}
+
+	return {
+		access_token: tokenData.access_token,
+		expires_on: tokenData.expires_on ? Number(tokenData.expires_on) * 1000 : Date.now() + 3600000,
+	};
+}
+
 export class AzureCosmosSdk implements INodeType {
 	description: INodeTypeDescription = {
 		displayName: 'Azure Cosmos DB (SDK)',
@@ -45,6 +83,15 @@ export class AzureCosmosSdk implements INodeType {
 					},
 				},
 			},
+			{
+				name: 'azureCosmosSdkEntraIdAppApi',
+				required: true,
+				displayOptions: {
+					show: {
+						authenticationType: ['entraIdApp'],
+					},
+				},
+			},
 		],
 		properties: [
 			{
@@ -58,9 +105,14 @@ export class AzureCosmosSdk implements INodeType {
 						description: 'Authenticate using Cosmos DB master key',
 					},
 					{
-						name: 'Microsoft Entra ID',
+						name: 'Microsoft Entra ID (Delegated)',
 						value: 'entraId',
-						description: 'Authenticate using Microsoft Entra ID (Azure AD) OAuth2',
+						description: 'Authenticate using delegated permissions with user login (user_impersonation scope)',
+					},
+					{
+						name: 'Microsoft Entra ID (Application)',
+						value: 'entraIdApp',
+						description: 'Authenticate using application permissions with client credentials (.default scope)',
 					},
 				],
 				default: 'masterKey',
@@ -702,7 +754,7 @@ export class AzureCosmosSdk implements INodeType {
 		let client: CosmosClient;
 		
 		if (authenticationType === 'entraId') {
-			// Use Entra ID authentication with Microsoft OAuth2
+			// Use Entra ID authentication with Microsoft OAuth2 (delegated permissions)
 			const entraIdCredentials = await this.getCredentials('azureCosmosSdkEntraIdApi');
 			const endpoint = entraIdCredentials.endpoint as string;
 			const oauthTokenData = entraIdCredentials.oauthTokenData as any;
@@ -747,6 +799,26 @@ export class AzureCosmosSdk implements INodeType {
 					return {
 						token: oauthTokenData.access_token,
 						expiresOnTimestamp: expiresAt || Date.now() + (3600 * 1000),
+					};
+				},
+			};
+
+			client = new CosmosClient({ endpoint, aadCredentials: tokenCredential });
+		} else if (authenticationType === 'entraIdApp') {
+			// Use Entra ID authentication with client credentials (application permissions)
+			const appCredentials = await this.getCredentials('azureCosmosSdkEntraIdAppApi');
+			const endpoint = appCredentials.endpoint as string;
+			const tenantId = appCredentials.tenantId as string;
+			const clientId = appCredentials.clientId as string;
+			const clientSecret = appCredentials.clientSecret as string;
+
+			const tokenResult = await fetchClientCredentialsToken(tenantId, clientId, clientSecret);
+
+			const tokenCredential: TokenCredential = {
+				async getToken() {
+					return {
+						token: tokenResult.access_token,
+						expiresOnTimestamp: tokenResult.expires_on,
 					};
 				},
 			};
@@ -1286,7 +1358,7 @@ export class AzureCosmosSdk implements INodeType {
 
 				try {
 					if (authenticationType === 'entraId') {
-						// Use Entra ID authentication
+						// Use Entra ID authentication (delegated)
 						const credentials = await this.getCredentials('azureCosmosSdkEntraIdApi');
 						const endpoint = credentials.endpoint as string;
 						const oauthTokenData = credentials.oauthTokenData as any;
@@ -1298,9 +1370,30 @@ export class AzureCosmosSdk implements INodeType {
 						const tokenCredential: TokenCredential = {
 							getToken: async () => ({
 								token: oauthTokenData.access_token,
-								expiresOnTimestamp: oauthTokenData.expires_at 
-									? new Date(oauthTokenData.expires_at).getTime() 
+								expiresOnTimestamp: oauthTokenData.expires_at
+									? new Date(oauthTokenData.expires_at).getTime()
 									: Date.now() + 3600000,
+							}),
+						};
+
+						client = new CosmosClient({
+							endpoint,
+							aadCredentials: tokenCredential,
+						});
+					} else if (authenticationType === 'entraIdApp') {
+						// Use Entra ID authentication (application / client credentials)
+						const appCredentials = await this.getCredentials('azureCosmosSdkEntraIdAppApi');
+						const endpoint = appCredentials.endpoint as string;
+						const tenantId = appCredentials.tenantId as string;
+						const clientId = appCredentials.clientId as string;
+						const clientSecret = appCredentials.clientSecret as string;
+
+						const tokenResult = await fetchClientCredentialsToken(tenantId, clientId, clientSecret);
+
+						const tokenCredential: TokenCredential = {
+							getToken: async () => ({
+								token: tokenResult.access_token,
+								expiresOnTimestamp: tokenResult.expires_on,
 							}),
 						};
 
@@ -1347,7 +1440,7 @@ export class AzureCosmosSdk implements INodeType {
 
 				try {
 					if (authenticationType === 'entraId') {
-						// Use Entra ID authentication
+						// Use Entra ID authentication (delegated)
 						const credentials = await this.getCredentials('azureCosmosSdkEntraIdApi');
 						const endpoint = credentials.endpoint as string;
 						const oauthTokenData = credentials.oauthTokenData as any;
@@ -1359,9 +1452,30 @@ export class AzureCosmosSdk implements INodeType {
 						const tokenCredential: TokenCredential = {
 							getToken: async () => ({
 								token: oauthTokenData.access_token,
-								expiresOnTimestamp: oauthTokenData.expires_at 
-									? new Date(oauthTokenData.expires_at).getTime() 
+								expiresOnTimestamp: oauthTokenData.expires_at
+									? new Date(oauthTokenData.expires_at).getTime()
 									: Date.now() + 3600000,
+							}),
+						};
+
+						client = new CosmosClient({
+							endpoint,
+							aadCredentials: tokenCredential,
+						});
+					} else if (authenticationType === 'entraIdApp') {
+						// Use Entra ID authentication (application / client credentials)
+						const appCredentials = await this.getCredentials('azureCosmosSdkEntraIdAppApi');
+						const endpoint = appCredentials.endpoint as string;
+						const tenantId = appCredentials.tenantId as string;
+						const clientId = appCredentials.clientId as string;
+						const clientSecret = appCredentials.clientSecret as string;
+
+						const tokenResult = await fetchClientCredentialsToken(tenantId, clientId, clientSecret);
+
+						const tokenCredential: TokenCredential = {
+							getToken: async () => ({
+								token: tokenResult.access_token,
+								expiresOnTimestamp: tokenResult.expires_on,
 							}),
 						};
 
@@ -1418,7 +1532,7 @@ export class AzureCosmosSdk implements INodeType {
 
 				try {
 					if (authenticationType === 'entraId') {
-						// Use Entra ID authentication
+						// Use Entra ID authentication (delegated)
 						const credentials = await this.getCredentials('azureCosmosSdkEntraIdApi');
 						const endpoint = credentials.endpoint as string;
 						const oauthTokenData = credentials.oauthTokenData as any;
@@ -1430,9 +1544,30 @@ export class AzureCosmosSdk implements INodeType {
 						const tokenCredential: TokenCredential = {
 							getToken: async () => ({
 								token: oauthTokenData.access_token,
-								expiresOnTimestamp: oauthTokenData.expires_at 
-									? new Date(oauthTokenData.expires_at).getTime() 
+								expiresOnTimestamp: oauthTokenData.expires_at
+									? new Date(oauthTokenData.expires_at).getTime()
 									: Date.now() + 3600000,
+							}),
+						};
+
+						client = new CosmosClient({
+							endpoint,
+							aadCredentials: tokenCredential,
+						});
+					} else if (authenticationType === 'entraIdApp') {
+						// Use Entra ID authentication (application / client credentials)
+						const appCredentials = await this.getCredentials('azureCosmosSdkEntraIdAppApi');
+						const endpoint = appCredentials.endpoint as string;
+						const tenantId = appCredentials.tenantId as string;
+						const clientId = appCredentials.clientId as string;
+						const clientSecret = appCredentials.clientSecret as string;
+
+						const tokenResult = await fetchClientCredentialsToken(tenantId, clientId, clientSecret);
+
+						const tokenCredential: TokenCredential = {
+							getToken: async () => ({
+								token: tokenResult.access_token,
+								expiresOnTimestamp: tokenResult.expires_on,
 							}),
 						};
 
